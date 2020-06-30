@@ -1,0 +1,26 @@
+<annotation>
+	<folder>videoplayback31</folder>
+	<filename>0318_8325.jpg</filename>
+	<path>D:\安全帽检测\scenario-test2\videoplayback31\0318_8325.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>640</width>
+		<height>360</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>person</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>282</xmin>
+			<ymin>66</ymin>
+			<xmax>332</xmax>
+			<ymax>351</ymax>
+		</bndbox>
+	</object>
+</annotation>
