@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
-from data import VOC_ROOT, VOCAnnotationTransform, VOCDetection, BaseTransform
-from data import VOC_CLASSES as labelmap
+from data import HELMET_ROOT, HelmetAnnotationTransform, HelmetDetection, BaseTransform
+from data import HELMET_CLASSES as labelmap
 import torch.utils.data as data
 
 from ssd import build_ssd
@@ -46,7 +46,9 @@ parser.add_argument('--top_k', default=5, type=int,
                     help='Further restrict the number of predictions to parse')
 parser.add_argument('--cuda', default=True, type=str2bool,
                     help='Use cuda to train model')
-parser.add_argument('--voc_root', default=VOC_ROOT,
+# parser.add_argument('--voc_root', default=VOC_ROOT,
+#                     help='Location of VOC root directory')
+parser.add_argument('--test_root', default=HELMET_ROOT,
                     help='Location of VOC root directory')
 parser.add_argument('--cleanup', default=True, type=str2bool,
                     help='Cleanup and remove results files following eval')
@@ -66,12 +68,12 @@ if torch.cuda.is_available():
 else:
     torch.set_default_tensor_type('torch.FloatTensor')
 
-annopath = os.path.join(args.voc_root, 'VOC2007', 'Annotations', '%s.xml')
-imgpath = os.path.join(args.voc_root, 'VOC2007', 'JPEGImages', '%s.jpg')
-imgsetpath = os.path.join(args.voc_root, 'VOC2007', 'ImageSets',
+annopath = os.path.join(args.test_root, 'scenario3-share', 'Annotations', '%s.xml')
+imgpath = os.path.join(args.test_root, 'scenario3-share', 'JPEGImages', '%s.jpg')
+imgsetpath = os.path.join(args.test_root, 'VOC2007', 'ImageSets',
                           'Main', '{:s}.txt')
 YEAR = '2007'
-devkit_path = args.voc_root + 'VOC' + YEAR
+devkit_path = args.test_root + 'VOC' + YEAR
 dataset_mean = (104, 117, 123)
 set_type = 'test'
 
@@ -267,11 +269,11 @@ cachedir: Directory for caching the annotations
         recs = {}
         for i, imagename in enumerate(imagenames):
             recs[imagename] = parse_rec(annopath % (imagename))
-            if i % 100 == 0:
-                print('Reading annotation for {:d}/{:d}'.format(
-                   i + 1, len(imagenames)))
+            # if i % 100 == 0:
+            #     print('Reading annotation for {:d}/{:d}'.format(
+            #        i + 1, len(imagenames)))
         # save
-        print('Saving cached annotations to {:s}'.format(cachefile))
+        # print('Saving cached annotations to {:s}'.format(cachefile))
         with open(cachefile, 'wb') as f:
             pickle.dump(recs, f)
     else:
@@ -378,11 +380,12 @@ def test_net(save_folder, net, cuda, dataset, transform, top_k,
     for i in range(num_images):
         im, gt, h, w = dataset.pull_item(i)
 
-        x = Variable(im.unsqueeze(0))
+        x = im.unsqueeze(0)
         if args.cuda:
             x = x.cuda()
         _t['im_detect'].tic()
-        detections = net(x).data
+        with torch.no_grad():
+            detections = net(x)
         detect_time = _t['im_detect'].toc(average=False)
 
         # skip j = 0, because it's the background class
@@ -411,6 +414,11 @@ def test_net(save_folder, net, cuda, dataset, transform, top_k,
 
     print('Evaluating detections')
     evaluate_detections(all_boxes, output_dir, dataset)
+    # my_evaluation(all_boxes, dataset)
+
+
+def my_evaluation(box_list, dataset):
+    pass
 
 
 def evaluate_detections(box_list, output_dir, dataset):
@@ -426,9 +434,9 @@ if __name__ == '__main__':
     net.eval()
     print('Finished loading model!')
     # load data
-    dataset = VOCDetection(args.voc_root, [('2007', set_type)],
-                           BaseTransform(300, dataset_mean),
-                           VOCAnnotationTransform())
+    dataset = HelmetDetection(args.test_root, ('scenario3-share', ),
+                              BaseTransform(300, dataset_mean),
+                              HelmetAnnotationTransform())
     if args.cuda:
         net = net.cuda()
         cudnn.benchmark = True

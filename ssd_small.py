@@ -23,9 +23,10 @@ class SmallSSD(nn.Module):
         self.loc = nn.ModuleList(head[0])
         self.conf = nn.ModuleList(head[1])
 
-        if phase == 'test':
-            self.softmax = nn.Softmax(dim=-1)
-            self.detect = Detect(num_classes, 0, 200, 0.01, 0.45)
+        self.conf_net_input = None
+
+        self.softmax = nn.Softmax(dim=-1)
+        self.detect = Detect(num_classes, 0, 200, 0.01, 0.45)
 
     def forward(self, x):
         sources, loc, conf = [], [], []
@@ -48,10 +49,11 @@ class SmallSSD(nn.Module):
         loc = torch.cat([o.view(o.size(0), -1) for o in loc], 1)
         conf = torch.cat([o.view(o.size(0), -1) for o in conf], 1)
         if self.phase == "test":
+            tmp = self.softmax(conf.view(conf.size(0), -1, self.num_classes))
+            self.conf_net_input = tmp
             output = self.detect(
                 loc.view(loc.size(0), -1, 4),  # loc preds
-                self.softmax(conf.view(conf.size(0), -1,
-                                       self.num_classes)),  # conf preds
+                tmp,  # conf preds
                 self.priors.type(x.dtype)  # default boxes
             )
         else:

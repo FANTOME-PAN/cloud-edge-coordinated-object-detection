@@ -60,4 +60,8 @@ class Detect(nn.Module):
         _, idx = flt[:, :, 0].sort(1, descending=True)
         _, rank = idx.sort(1)
         flt[(rank < self.top_k).unsqueeze(-1).expand_as(flt)].fill_(0)
+        # output[batch_index][class_index] = list of (score, box), in descending order of score
+        # output batch_num * num_classes * top_k * 5
+        # top_k = 200 by default. if number of valid boxes is less than that, skill keep top-k elements(zero filled);
+        #                         otherwise, only keep top-k elements.
         return output
