@@ -115,7 +115,7 @@ def train(path, conf_dataset_path=None):
     else:
         conf_dataset = torch.load(conf_dataset_path)
 
-    conf_dloader = data.DataLoader(dataset, args.batch_size,
+    conf_dloader = data.DataLoader(conf_dataset, args.batch_size,
                                    num_workers=args.num_workers,
                                    shuffle=True,
                                    pin_memory=True)
