@@ -1,6 +1,8 @@
 import sys
 import numpy as np
 import torch
+from data.helmet import HELMET_CLASSES
+from layers.box_utils import jaccard
 import pickle
 if sys.version_info[0] == 2:
     import xml.etree.cElementTree as ET
@@ -83,7 +85,26 @@ def decode_raw_detection(detection, h, w):
 # step 1: find gt bbox with the same class and with max IOU for each detection bbox
 # step 2: score = IOU * score
 # step 3: ret = scores.mean()
-def get_conf_gt(detection, h, w, annopath):
+def get_conf_gt(detection, h, w, annopath, classes=HELMET_CLASSES):
+    num_classes = len(HELMET_CLASSES)
     dets = decode_raw_detection(detection, h, w)
+    assert num_classes == len(dets)
     rec = parse_rec(annopath)
+    bbgt = [torch.tensor([]) for _ in range(num_classes)]
+    for cls_idx in range(num_classes):
+        bbgt[cls_idx] = torch.tensor([x['bbox'] for x in rec if x['name'] == classes[cls_idx]], dtype=torch.float)
+    bbdet = [dets[i][:, 1:].cpu() for i in range(len(dets))]
+
+    cls_ious = [torch.tensor([]) for _ in range(num_classes)]
+    for cls_idx in range(num_classes):
+        # K * 4
+        bb = bbdet[cls_idx]
+        # N * 4
+        gt = bbgt[cls_idx]
+        iou = jaccard(gt, bb).t()
+        cls_ious[cls_idx] = iou
+    max_ious = [x.max(1)[0] for x in cls_ious]
+    return cls_ious, max_ious
+
+
 
