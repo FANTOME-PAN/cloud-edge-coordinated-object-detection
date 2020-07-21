@@ -1,5 +1,6 @@
 import sys
 import numpy as np
+import torch
 import pickle
 if sys.version_info[0] == 2:
     import xml.etree.cElementTree as ET
@@ -59,3 +60,30 @@ def voc_ap(rec, prec, use_07_metric=True):
         # and sum (\Delta recall) * prec
         ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
     return ap
+
+
+# detection size: 1 * num_clasess * top_k * 5(score, bbox)
+def decode_raw_detection(detection, h, w):
+    dets = [torch.tensor([]) for _ in range(detection.size(1) - 1)]
+    for cls_idx in range(detection.size(1) - 1):
+        cls_det = detection[0, cls_idx + 1]
+        mask = (cls_det[:, 0] > 0.).unsqueeze(-1).expand_as(cls_det)
+        cls_det = cls_det[mask].view(-1, 5)
+
+        if cls_det.size(0) == 0:
+            continue
+        cls_det[:, 1] *= w
+        cls_det[:, 3] *= w
+        cls_det[:, 2] *= h
+        cls_det[:, 4] *= h
+        dets[cls_idx] = cls_det
+    return dets
+
+
+# step 1: find gt bbox with the same class and with max IOU for each detection bbox
+# step 2: score = IOU * score
+# step 3: ret = scores.mean()
+def get_conf_gt(detection, h, w, annopath):
+    dets = decode_raw_detection(detection, h, w)
+    rec = parse_rec(annopath)
+

@@ -13,12 +13,15 @@ import argparse
 from train_big_ssd import adjust_learning_rate, weights_init
 from data.config import helmet_lite
 from small_net import SmallNet, ConfNet1
-from utils.evaluations import parse_rec, voc_ap
+from utils.evaluations import parse_rec, voc_ap, get_conf_gt
+import os.path as osp
 
 
 def str2bool(v):
     return v.lower() in ("yes", "true", "t", "1")
 
+
+annopath = osp.join('%s', 'Annotations', '%s.xml')
 
 parser = argparse.ArgumentParser(
     description='Single Shot MultiBox Detector Training With Pytorch')
@@ -27,6 +30,10 @@ parser.add_argument('--dataset', default='helmet', choices=['VOC', 'COCO', 'helm
                     type=str, help='VOC or COCO')
 parser.add_argument('--dataset_root', default=HELMET_ROOT,
                     help='Dataset root directory path')
+parser.add_argument('--bignet', default='helmet_big_net.pth',
+                    help='Big net for knowledge distilling')
+parser.add_argument('--conf_dataset', default=None,
+                    help='The dataset for training confidence net')
 parser.add_argument('--basenet', default=None,
                     help='Pretrained base model')
 parser.add_argument('--batch_size', default=32, type=int,
@@ -54,7 +61,7 @@ parser.add_argument('--save_folder', default='weights/',
 args = parser.parse_args()
 
 
-def train(path, conf_dataset_path=None):
+def train(skip_det_net=False):
     if args.dataset == 'COCO':
         raise NotImplementedError()
     elif args.dataset == 'VOC':
@@ -67,7 +74,7 @@ def train(path, conf_dataset_path=None):
     ssd_net = build_small_ssd('train', cfg['min_dim'], cfg['num_classes'])
     net = ssd_net
     big_net = build_ssd('train', helmet['min_dim'], helmet['num_classes']).cuda()
-    big_net.load_state_dict(torch.load(path))
+    big_net.load_state_dict(torch.load(args.save_folder + args.bignet))
     conf_net = ConfNet1()
     small_net = SmallNet(ssd_net, conf_net)
 
@@ -85,12 +92,12 @@ def train(path, conf_dataset_path=None):
         ssd_net.load_weights(args.resume)
     else:
         if args.basenet is None:
-            print('Training vgg lite')
+            print('Training base net (vgg lite & conv6 conv7)')
             train_vgg(ssd_net.cuda(), big_net, data_loader)
         else:
             init_ssd_weights = torch.load(args.save_folder + args.basenet)
             print('Loading base network...')
-            ssd_net.load_state_dict(init_ssd_weights)
+            net.load_state_dict(init_ssd_weights)
 
     if args.cuda:
         net = net.cuda()
@@ -105,15 +112,20 @@ def train(path, conf_dataset_path=None):
     net.train()
 
     print('Start training...')
-    train_detection_net(net, big_net, data_loader, cfg, True)
-    torch.save(ssd_net.state_dict(), args.save_foler + 'small_net_ssd.pth')
+    if not skip_det_net:
+        train_detection_net(net, big_net, data_loader, cfg, True)
+        torch.save(ssd_net.state_dict(), args.save_folder + 'helmet_detection_net.pth')
+    else:
+        print('skip training detection net.')
 
     # prepare data for confidence net
-    if conf_dataset_path is None:
-        conf_dataset = prepare_data_for_conf_net(small_net, dataset)
-        torch.save(conf_dataset, args.save_foler + 'confidence_dataset.pkl')
+    if args.conf_dataset is None:
+        test_dataset = HelmetDetection(root=HELMET_ROOT,
+                                       transform=BaseTransform(300, MEANS))
+        conf_dataset = prepare_data_for_conf_net(small_net, test_dataset, skip_preprocess=False)
+        torch.save(conf_dataset, args.save_folder + 'conf_dataset.pkl')
     else:
-        conf_dataset = torch.load(conf_dataset_path)
+        conf_dataset = torch.load(args.save_folder + args.conf_dataset)
 
     conf_dloader = data.DataLoader(conf_dataset, args.batch_size,
                                    num_workers=args.num_workers,
@@ -137,13 +149,13 @@ def train_vgg(net: SmallSSD, big_net: SSD, data_loader: data.DataLoader, cfg=hel
 
     # loss counters
     total_loss = 0.
-
     step_index = 0
 
     # create batch iterator
     batch_iterator = iter(data_loader)
-    for iteration in range(args.start_iter, cfg['max_iter']):
-        if iteration in cfg['lr_steps']:
+    ts = time.time()
+    for iteration in range(20000):
+        if iteration in [15000, 17500, 20000]:
             step_index += 1
             adjust_learning_rate(optimizer, args.gamma, step_index)
 
@@ -173,7 +185,7 @@ def train_vgg(net: SmallSSD, big_net: SSD, data_loader: data.DataLoader, cfg=hel
             print('timer: %.4f sec.' % (t1 - t0))
             print('iter ' + repr(iteration) + ' || Loss: %.4f ||' % loss.item(), end=' ')
 
-        if iteration != 0 and iteration % 500 == 0:
+        if iteration != 0 and iteration % 5000 == 0:
             print('Saving state, iter:', iteration)
             torch.save(net.state_dict(), 'weights/small_ssd_vgg_' +
                        repr(iteration) + '.pth')
@@ -245,51 +257,76 @@ def train_detection_net(net: SmallSSD, big_net: SSD, data_loader: data.DataLoade
 
 
 # 当 mAP 大于 conf_thresh，将 GT 设为 1；否则，设为 0
-def prepare_data_for_conf_net(net: SmallNet, dataset, conf_thresh=0.5):
+def prepare_data_for_conf_net(net: SmallNet, dataset, conf_thresh=0.5, skip_preprocess=False):
     net.det_net.phase = 'test'
     num_images = len(dataset)
     all_boxes = [[np.array([]) for _ in range(num_images)]
                  for _ in range(len(HELMET_CLASSES) + 1)]
     x_tensor = []
     y_tensor = []
+    if not skip_preprocess:
+        num_str = str(num_images)
+        for i in range(num_images):
+            im, gt, h, w = dataset.pull_item(i)
+            x = im.unsqueeze(0).cuda()
 
-    for i in range(num_images):
-        im, gt, h, w = dataset.pull_item(i)
+            with torch.no_grad():
+                detections = net(x)
+            x_tensor.append(net.det_net.conf_net_input.cpu())
+            get_conf_gt(detections, h, w, annopath % dataset.ids[i])
 
-        x = im.unsqueeze(0).cuda()
+            for j in range(1, detections.size(1)):
+                dets = detections[0, j, :]
+                mask = dets[:, 0].gt(0.).expand(5, dets.size(0)).t()
+                dets = torch.masked_select(dets, mask).view(-1, 5)
+                if dets.size(0) == 0:
+                    continue
+                boxes = dets[:, 1:]
+                boxes[:, 0] *= w
+                boxes[:, 2] *= w
+                boxes[:, 1] *= h
+                boxes[:, 3] *= h
+                scores = dets[:, 0].cpu().numpy()
+                cls_dets = np.hstack((boxes.cpu().numpy(),
+                                      scores[:, np.newaxis])).astype(np.float32,
+                                                                     copy=False)
+                all_boxes[j][i] = cls_dets
+            print('image %s / %s' % (str(i + 1).zfill(len(num_str)), num_str))
 
-        with torch.no_grad():
-            detections = net(x)
-        x_tensor.append(net.det_net.conf_net_input.cpu())
-
-        for j in range(1, detections.size(1)):
-            dets = detections[0, j, :]
-            mask = dets[:, 0].gt(0.).expand(5, dets.size(0)).t()
-            dets = torch.masked_select(dets, mask).view(-1, 5)
-            if dets.size(0) == 0:
-                continue
-            boxes = dets[:, 1:]
-            boxes[:, 0] *= w
-            boxes[:, 2] *= w
-            boxes[:, 1] *= h
-            boxes[:, 3] *= h
-            scores = dets[:, 0].cpu().numpy()
-            cls_dets = np.hstack((boxes.cpu().numpy(),
-                                  scores[:, np.newaxis])).astype(np.float32,
-                                                                 copy=False)
-            all_boxes[j][i] = cls_dets
+        import pickle
+        with open('x_tensor.pkl', 'wb') as f:
+            pickle.dump(x_tensor, f)
+        print('x_tensor saved.')
+        with open('all_boxes.pkl', 'wb') as f:
+            pickle.dump(all_boxes, f)
+        print('all_boxes saved.')
 
     # write voc results file
-    det_file_dict = [[] for _ in range(len(HELMET_CLASSES))]
-    for cls_idx, cls in enumerate(HELMET_CLASSES):
-        for im_idx in range(len(dataset)):
-            dets = all_boxes[cls_idx + 1][im_idx]
-            if len(dets) == 0:
-                continue
-            # index[1] is the file name. e.g. 000001
-            for k in range(dets.shape[0]):
-                det_file_dict[cls_idx].append((im_idx, dets[k, -1],
-                                               *(dets[k, :4] + 1)))
+    if not skip_preprocess:
+        det_file_dict = [[] for _ in range(len(HELMET_CLASSES))]
+        for cls_idx, cls in enumerate(HELMET_CLASSES):
+            for im_idx in range(len(dataset)):
+                dets = all_boxes[cls_idx + 1][im_idx]
+                if len(dets) == 0:
+                    continue
+                # index[1] is the file name. e.g. 000001
+                for k in range(dets.shape[0]):
+                    det_file_dict[cls_idx].append((im_idx, dets[k, -1],
+                                                   *(dets[k, :4] + 1)))
+        import pickle
+        with open('det_file_dict.pkl', 'wb') as f:
+            pickle.dump(det_file_dict, f)
+        print('det_file_dict saved.')
+
+    if skip_preprocess:
+        import pickle
+        with open('x_tensor.pkl', 'rb') as f:
+            x_tensor = pickle.load(f)
+        with open('all_boxes.pkl', 'rb') as f:
+            all_boxes = pickle.load(f)
+        with open('det_file_dict.pkl', 'rb') as f:
+            det_file_dict = pickle.load(f)
+
     # eval
     for im_idx in range(len(dataset)):
         print('IMAGE ID %d:' % im_idx)
@@ -304,88 +341,90 @@ def prepare_data_for_conf_net(net: SmallNet, dataset, conf_thresh=0.5):
     return data.TensorDataset(x_tensor, y_tensor)
 
 
-def my_voc_eval(det_file_dict, cls_idx, dataset, ovthresh=0.5):
-    class_recs = [dict() for i in range(len(dataset))]
-    npos = 0
-    for i in range(len(dataset)):
-        im, gt = dataset[i]
-        R = [obj for obj in gt if obj[-1] == cls_idx]
-        bbox = np.array([obj[:4] for obj in R])
-        det = [False] * len(R)
-        npos += len(R)
-        class_recs[i] = {'bbox': bbox,
-                         'det': det}
-
-    det_file = det_file_dict[cls_idx]
-    if len(det_file) > 0:
-        image_ids = [x[0] for x in det_file]
-        confidence = np.array([x[1] for x in det_file])
-        BB = np.array([[z for z in x[2:]] for x in det_file])
-
-        # sort by confidence score
-        sorted_idx = np.argsort(-confidence)
-        # sorted_scores = np.sort(-confidence)
-        BB = BB[sorted_idx, :]
-        image_ids = [image_ids[x] for x in sorted_idx]
-
-        # mark TPs and FPs
-        nd = len(image_ids)
-        tp = np.zeros(nd)
-        fp = np.zeros(nd)
-        jmax = 999999
-        for d in range(nd):
-            R = class_recs[image_ids[d]]
-            bb = BB[d, :].astype(float)
-            ovmax = -np.inf
-            BBGT = R['bbox'].astype(float)
-            if BBGT.size > 0:
-                # compute overlaps
-                # intersection
-                ixmin = np.maximum(BBGT[:, 0], bb[0])
-                iymin = np.maximum(BBGT[:, 1], bb[1])
-                ixmax = np.minimum(BBGT[:, 2], bb[2])
-                iymax = np.minimum(BBGT[:, 3], bb[3])
-                iw = np.maximum(ixmax - ixmin, 0.)
-                ih = np.maximum(iymax - iymin, 0.)
-                inters = iw * ih
-                uni = ((bb[2] - bb[0]) * (bb[3] - bb[1]) +
-                       (BBGT[:, 2] - BBGT[:, 0]) *
-                       (BBGT[:, 3] - BBGT[:, 1]) - inters)
-                overlaps = inters / uni
-                ovmax = np.max(overlaps)
-                jmax = np.argmax(overlaps)
-
-            if ovmax > ovthresh:
-                if not R['det'][jmax]:
-                    tp[d] = 1.
-                    R['det'][jmax] = 1
-                else:
-                    fp[d] = 1.
-            else:
-                fp[d] = 1.
-
-        fp = np.cumsum(fp)
-        tp = np.cumsum(tp)
-        rec = tp / float(npos)
-
-        prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
-        ap = voc_ap(rec, prec)
-    else:
-        rec = -1.
-        prec = -1.
-        ap = -1.
-    return rec, prec, ap
-
+# def my_voc_eval(det_file_dict, cls_idx, dataset, ovthresh=0.5):
+#     class_recs = [dict() for i in range(len(dataset))]
+#     npos = 0
+#     for i in range(len(dataset)):
+#         im, gt = dataset[i]
+#         R = [obj for obj in gt if obj[-1] == cls_idx]
+#         bbox = np.array([obj[:4] for obj in R])
+#         det = [False] * len(R)
+#         npos += len(R)
+#         class_recs[i] = {'bbox': bbox,
+#                          'det': det}
+#
+#     det_file = det_file_dict[cls_idx]
+#     if len(det_file) > 0:
+#         image_ids = [x[0] for x in det_file]
+#         confidence = np.array([x[1] for x in det_file])
+#         BB = np.array([[z for z in x[2:]] for x in det_file])
+#
+#         # sort by confidence score
+#         sorted_idx = np.argsort(-confidence)
+#         # sorted_scores = np.sort(-confidence)
+#         BB = BB[sorted_idx, :]
+#         image_ids = [image_ids[x] for x in sorted_idx]
+#
+#         # mark TPs and FPs
+#         nd = len(image_ids)
+#         tp = np.zeros(nd)
+#         fp = np.zeros(nd)
+#         jmax = 999999
+#         for d in range(nd):
+#             R = class_recs[image_ids[d]]
+#             bb = BB[d, :].astype(float)
+#             ovmax = -np.inf
+#             BBGT = R['bbox'].astype(float)
+#             if BBGT.size > 0:
+#                 # compute overlaps
+#                 # intersection
+#                 ixmin = np.maximum(BBGT[:, 0], bb[0])
+#                 iymin = np.maximum(BBGT[:, 1], bb[1])
+#                 ixmax = np.minimum(BBGT[:, 2], bb[2])
+#                 iymax = np.minimum(BBGT[:, 3], bb[3])
+#                 iw = np.maximum(ixmax - ixmin, 0.)
+#                 ih = np.maximum(iymax - iymin, 0.)
+#                 inters = iw * ih
+#                 uni = ((bb[2] - bb[0]) * (bb[3] - bb[1]) +
+#                        (BBGT[:, 2] - BBGT[:, 0]) *
+#                        (BBGT[:, 3] - BBGT[:, 1]) - inters)
+#                 overlaps = inters / uni
+#                 ovmax = np.max(overlaps)
+#                 jmax = np.argmax(overlaps)
+#
+#             if ovmax > ovthresh:
+#                 if not R['det'][jmax]:
+#                     tp[d] = 1.
+#                     R['det'][jmax] = 1
+#                 else:
+#                     fp[d] = 1.
+#             else:
+#                 fp[d] = 1.
+#
+#         fp = np.cumsum(fp)
+#         tp = np.cumsum(tp)
+#         rec = tp / float(npos)
+#
+#         prec = tp / np.maximum(tp + fp, np.finfo(np.float64).eps)
+#         ap = voc_ap(rec, prec)
+#     else:
+#         rec = -1.
+#         prec = -1.
+#         ap = -1.
+#     return rec, prec, ap
+#
 
 def my_voc_eval_per_img(det_file_dict, cls_idx, dataset, idx, ovthresh=0.5):
     # class_recs = [dict() for i in range(len(dataset))]
     npos = 0
     # for i in range(len(dataset)):
-    im, gt = dataset[idx]
-    R = [obj for obj in gt if obj[-1] == cls_idx]
+    #  dataset.ids[idx]
+    rec = parse_rec(annopath % dataset.ids[idx])
+    # im, gt = dataset[idx]
+    R = [obj for obj in rec if obj['name'] == HELMET_CLASSES[cls_idx]]
     if len(R) == 0:
         return -1., -1., -1.
-    bbox = np.array([obj[:4] for obj in R])
+    bbox = np.array([obj['bbox'] for obj in R])
     det = [False] * len(R)
     npos += len(R)
     class_rec = {'bbox': bbox, 'det': det}
@@ -534,4 +573,4 @@ def train_confidence_net(net, data_loader: data.DataLoader):
 
 
 if __name__ == '__main__':
-    train('weights/ssd300_helmet_4000.pth')
+    train(True)
