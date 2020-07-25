@@ -13,7 +13,7 @@ from data import HELMET_ROOT, HelmetAnnotationTransform, HelmetDetection, BaseTr
 from data import HELMET_CLASSES as labelmap
 import torch.utils.data as data
 from utils.evaluations import get_conf_gt, output_detection_result
-
+from ssd_small import build_small_ssd, SmallSSD
 from ssd import build_ssd
 
 import sys
@@ -395,7 +395,7 @@ def test_net(save_folder, net, cuda, dataset, transform, top_k,
         _imgpath = os.path.join('%s', 'JPEGImages', '%s.jpg')
         _annopath = os.path.join('%s', 'Annotations', '%s.xml')
         output_detection_result(_imgpath, dataset.ids[i], detections, h, w, score_thresh=0.25,
-                                out_dir='./eval/bignet_output', annopath=_annopath, show=False)
+                                out_dir='./eval/smallnet_output', annopath=_annopath, show=False)
         detect_time = _t['im_detect'].toc(average=False)
 
         # skip j = 0, because it's the background class
@@ -439,7 +439,7 @@ def evaluate_detections(box_list, output_dir, dataset):
 if __name__ == '__main__':
     # load net
     num_classes = len(labelmap) + 1                      # +1 for background
-    net = build_ssd('test', 300, num_classes)            # initialize SSD
+    net = build_small_ssd('test', 300, num_classes)            # initialize SSD
     net.load_state_dict(torch.load(args.trained_model))
     net.eval()
     print('Finished loading model!')

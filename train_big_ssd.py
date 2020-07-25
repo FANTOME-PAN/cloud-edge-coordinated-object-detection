@@ -2,6 +2,7 @@ from data import *
 from utils.augmentations import SSDAugmentation
 from layers.modules import MultiBoxLoss
 from ssd import build_ssd
+from data.voc0712 import VOC_ROOT, VOCDetection
 import os
 import sys
 import time
@@ -75,7 +76,9 @@ def train():
     if args.dataset == 'COCO':
         raise NotImplementedError()
     elif args.dataset == 'VOC':
-        raise NotImplementedError()
+        # raise NotImplementedError()
+        cfg = voc
+        dataset = VOCDetection(root=VOC_ROOT, transform=SSDAugmentation(cfg['min_dim'], MEANS))
     elif args.dataset == 'helmet':
         cfg = helmet
         dataset = HelmetDetection(root=HELMET_ROOT, transform=SSDAugmentation(cfg['min_dim'], MEANS))
@@ -138,6 +141,13 @@ def train():
                                   pin_memory=True)
     # create batch iterator
     batch_iterator = iter(data_loader)
+    for step in cfg['lr_steps']:
+        if args.start_iter > step:
+            print('over %d steps, adjust lr' % step)
+            step_index += 1
+            adjust_learning_rate(optimizer, args.gamma, step_index)
+        else:
+            break
     for iteration in range(args.start_iter, cfg['max_iter']):
         if args.visdom and iteration != 0 and (iteration % epoch_size == 0):
             update_vis_plot(epoch, loc_loss, conf_loss, epoch_plot, None,
@@ -188,7 +198,7 @@ def train():
 
         if iteration != 0 and iteration % 5000 == 0:
             print('Saving state, iter:', iteration)
-            torch.save(ssd_net.state_dict(), 'weights/ssd300_helmet_' +
+            torch.save(ssd_net.state_dict(), ('weights/ssd300_%s_' % args.dataset) +
                        repr(iteration) + '.pth')
     torch.save(ssd_net.state_dict(),
                args.save_folder + '' + args.dataset + '.pth')

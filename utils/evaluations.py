@@ -4,6 +4,7 @@ import torch
 from data.helmet import HELMET_CLASSES
 from layers.box_utils import jaccard
 import pickle
+import cv2
 if sys.version_info[0] == 2:
     import xml.etree.cElementTree as ET
 else:
@@ -74,6 +75,8 @@ def decode_raw_detection(detection, h, w):
 
         if cls_det.size(0) == 0:
             continue
+        assert isinstance(cls_det, torch.Tensor)
+        cls_det.clamp_(0., 1.)
         cls_det[:, 1] *= w
         cls_det[:, 3] *= w
         cls_det[:, 2] *= h
@@ -85,15 +88,17 @@ def decode_raw_detection(detection, h, w):
 # step 1: find gt bbox with the same class and with max IOU for each detection bbox
 # step 2: score = IOU * score
 # step 3: ret = scores.mean()
-def get_conf_gt(detection, h, w, annopath, classes=HELMET_CLASSES):
+def get_conf_gt(detection, h, w, annopath, classes=HELMET_CLASSES, cls_to_ind=None):
     num_classes = len(HELMET_CLASSES)
     dets = decode_raw_detection(detection, h, w)
     assert num_classes == len(dets)
+    if cls_to_ind is None:
+        cls_to_ind = dict(zip(classes, range(len(classes))))
     rec = parse_rec(annopath)
     bbgt = [torch.tensor([]) for _ in range(num_classes)]
     for cls_idx in range(num_classes):
-        bbgt[cls_idx] = torch.tensor([x['bbox'] for x in rec if x['name'] == classes[cls_idx]], dtype=torch.float)
-    bbdet = [dets[i][:, 1:].cpu() for i in range(len(dets))]
+        bbgt[cls_idx] = torch.tensor([x['bbox'] for x in rec if cls_to_ind[x['name']] == cls_idx], dtype=torch.float)
+    bbdet = [dets[i][:, 1:] if dets[i].size(0) > 0 else torch.tensor([]) for i in range(len(dets))]
 
     cls_ious = [torch.tensor([]) for _ in range(num_classes)]
     for cls_idx in range(num_classes):
@@ -101,10 +106,40 @@ def get_conf_gt(detection, h, w, annopath, classes=HELMET_CLASSES):
         bb = bbdet[cls_idx]
         # N * 4
         gt = bbgt[cls_idx]
+        if gt.size(0) == 0 or bb.size(0) == 0:
+            continue
         iou = jaccard(gt, bb).t()
         cls_ious[cls_idx] = iou
-    max_ious = [x.max(1)[0] for x in cls_ious]
+    max_ious = [x.max(1)[0] if x.size(0) > 0 else None for x in cls_ious]
     return cls_ious, max_ious
 
 
+def output_detection_result(img_path, ids, detections, h, w, classes=HELMET_CLASSES,
+                            score_thresh=0.7, out_dir='./eval/imgs', annopath=None, show=False):
+    dets = decode_raw_detection(detections, h, w)
+    img = cv2.imread(img_path % ids)
+    color_red = (0, 0, 255)
+    color_green = (0, 255, 0)
 
+    if annopath is not None:
+        rec = parse_rec(annopath % ids)
+        bbgt = [obj['bbox'] for obj in rec]
+        for xx1, yy1, xx2, yy2 in bbgt:
+            cv2.rectangle(img, (xx1, yy1), (xx2, yy2), color_green, thickness=2)
+
+    for cls_idx in range(len(classes)):
+        det = dets[cls_idx]
+        for i in range(det.size(0)):
+            if det[i, 0] <= score_thresh:
+                continue
+            xx1, yy1, xx2, yy2 = det[i, 1:].type(torch.int)
+            cv2.rectangle(img, (xx1, yy1), (xx2, yy2), color_red, thickness=1)
+            cv2.putText(img, text='%s:%.2f' % (classes[cls_idx], det[i, 0].item()),
+                        org=(xx1 + 2, yy1 + 11), fontFace=cv2.FONT_HERSHEY_COMPLEX,
+                        fontScale=0.4, color=color_red)
+    if show:
+        cv2.imshow(ids[1], img)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    path = out_dir + '/%s_det_result.jpg' % ids[1]
+    cv2.imwrite(path, img)
