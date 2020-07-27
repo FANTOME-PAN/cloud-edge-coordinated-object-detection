@@ -10,12 +10,11 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.autograd import Variable
 from data import HELMET_ROOT, HelmetAnnotationTransform, HelmetDetection, BaseTransform
-from data import HELMET_CLASSES as labelmap
+from data import HELMET_CLASSES
+from data.voc0712 import VOC_CLASSES, VOCDetection, VOCAnnotationTransform, VOC_ROOT
 import torch.utils.data as data
 from utils.evaluations import get_conf_gt, output_detection_result
-from ssd_small import build_small_ssd, SmallSSD
-from ssd import build_ssd
-
+from ssd_small import build_small_ssd
 import sys
 import os
 import time
@@ -36,8 +35,10 @@ def str2bool(v):
 
 parser = argparse.ArgumentParser(
     description='Single Shot MultiBox Detector Evaluation')
+parser.add_argument('--dataset', default='helmet', choices=['VOC', 'COCO', 'helmet'],
+                    type=str, help='VOC or COCO')
 parser.add_argument('--trained_model',
-                    default='weights/ssd300_mAP_77.43_v2.pth', type=str,
+                    default='weights/det_net_VOC.pth', type=str,
                     help='Trained state_dict file path to open')
 parser.add_argument('--save_folder', default='eval/', type=str,
                     help='File path to save results')
@@ -49,8 +50,10 @@ parser.add_argument('--cuda', default=True, type=str2bool,
                     help='Use cuda to train model')
 # parser.add_argument('--voc_root', default=VOC_ROOT,
 #                     help='Location of VOC root directory')
-parser.add_argument('--test_root', default=HELMET_ROOT,
-                    help='Location of VOC root directory')
+# parser.add_argument('--test_root', default=HELMET_ROOT,
+#                     help='Location of VOC root directory')
+parser.add_argument('--write_imgs', default=False, type=str2bool,
+                    help='write results')
 parser.add_argument('--cleanup', default=True, type=str2bool,
                     help='Cleanup and remove results files following eval')
 
@@ -69,12 +72,25 @@ if torch.cuda.is_available():
 else:
     torch.set_default_tensor_type('torch.FloatTensor')
 
-annopath = os.path.join(args.test_root, 'scenario3-share', 'Annotations', '%s.xml')
-imgpath = os.path.join(args.test_root, 'scenario3-share', 'JPEGImages', '%s.jpg')
-imgsetpath = os.path.join(args.test_root, 'VOC2007', 'ImageSets',
-                          'Main', '{:s}.txt')
+if args.dataset == 'helmet':
+    labelmap = HELMET_CLASSES
+    root = HELMET_ROOT
+    annopath = os.path.join(root, 'scenario3-share', 'Annotations', '%s.xml')
+    imgpath = os.path.join(root, 'scenario3-share', 'JPEGImages', '%s.jpg')
+    imgsetpath = os.path.join(root, 'VOC2007', 'ImageSets',
+                              'Main', '{:s}.txt')
+elif args.dataset == 'VOC':
+    labelmap = VOC_CLASSES
+    root = VOC_ROOT
+    annopath = os.path.join(root, 'VOC2007', 'Annotations', '%s.xml')
+    imgpath = os.path.join(root, 'VOC2007', 'JPEGImages', '%s.jpg')
+    imgsetpath = os.path.join(root, 'VOC2007', 'ImageSets', 'Main') + '/{:s}.txt'
+
+else:
+    raise NotImplementedError()
+
 YEAR = '2007'
-devkit_path = args.test_root + 'VOC' + YEAR
+devkit_path = root + 'VOC' + YEAR
 dataset_mean = (104, 117, 123)
 set_type = 'test'
 
@@ -392,43 +408,42 @@ def test_net(save_folder, net, cuda, dataset, transform, top_k,
             detections = net(x)
         # get_conf_gt(detections, h, w, annopath % dataset.ids[i][1],
         #             cls_to_ind=dataset.target_transform.class_to_ind)
-        _imgpath = os.path.join('%s', 'JPEGImages', '%s.jpg')
-        _annopath = os.path.join('%s', 'Annotations', '%s.xml')
-        output_detection_result(_imgpath, dataset.ids[i], detections, h, w, score_thresh=0.25,
-                                out_dir='./eval/smallnet_output', annopath=_annopath, show=False)
+        if args.write_imgs:
+            _imgpath = os.path.join('%s', 'JPEGImages', '%s.jpg')
+            _annopath = os.path.join('%s', 'Annotations', '%s.xml')
+            output_detection_result(_imgpath, dataset.ids[i], detections, h, w, classes=labelmap, score_thresh=0.25,
+                                    out_dir='./eval/%s/smallnet_output' % args.dataset, annopath=_annopath, show=False)
         detect_time = _t['im_detect'].toc(average=False)
 
         # skip j = 0, because it's the background class
-        for j in range(1, detections.size(1)):
-            dets = detections[0, j, :]
-            mask = dets[:, 0].gt(0.).expand(5, dets.size(0)).t()
-            dets = torch.masked_select(dets, mask).view(-1, 5)
-            if dets.size(0) == 0:
-                continue
-            boxes = dets[:, 1:]
-            boxes[:, 0] *= w
-            boxes[:, 2] *= w
-            boxes[:, 1] *= h
-            boxes[:, 3] *= h
-            scores = dets[:, 0].cpu().numpy()
-            cls_dets = np.hstack((boxes.cpu().numpy(),
-                                  scores[:, np.newaxis])).astype(np.float32,
-                                                                 copy=False)
-            all_boxes[j][i] = cls_dets
+        if not args.write_imgs:
+            for j in range(1, detections.size(1)):
+                dets = detections[0, j, :]
+                mask = dets[:, 0].gt(0.).expand(5, dets.size(0)).t()
+                dets = torch.masked_select(dets, mask).view(-1, 5)
+                if dets.size(0) == 0:
+                    continue
+                boxes = dets[:, 1:]
+                boxes[:, 0] *= w
+                boxes[:, 2] *= w
+                boxes[:, 1] *= h
+                boxes[:, 3] *= h
+                scores = dets[:, 0].cpu().numpy()
+                cls_dets = np.hstack((boxes.cpu().numpy(),
+                                      scores[:, np.newaxis])).astype(np.float32,
+                                                                     copy=False)
+                all_boxes[j][i] = cls_dets
 
         print('im_detect: {:d}/{:d} {:.3f}s'.format(i + 1,
                                                     num_images, detect_time))
-    return
+    if args.write_imgs:
+        return
     with open(det_file, 'wb') as f:
         pickle.dump(all_boxes, f, pickle.HIGHEST_PROTOCOL)
 
     print('Evaluating detections')
     evaluate_detections(all_boxes, output_dir, dataset)
     # my_evaluation(all_boxes, dataset)
-
-
-def my_evaluation(box_list, dataset):
-    pass
 
 
 def evaluate_detections(box_list, output_dir, dataset):
@@ -444,9 +459,17 @@ if __name__ == '__main__':
     net.eval()
     print('Finished loading model!')
     # load data
-    dataset = HelmetDetection(args.test_root, ('scenario3-share', ),
-                              BaseTransform(300, dataset_mean),
-                              HelmetAnnotationTransform())
+    if args.dataset == 'helmet':
+        dataset = HelmetDetection(root, ('scenario3-share', ),
+                                  BaseTransform(300, dataset_mean),
+                                  HelmetAnnotationTransform())
+    elif args.dataset == 'VOC':
+        dataset = VOCDetection(root, [('2007', 'test')],
+                               BaseTransform(300, dataset_mean),
+                               VOCAnnotationTransform())
+    else:
+        raise NotImplementedError()
+
     if args.cuda:
         net = net.cuda()
         cudnn.benchmark = True

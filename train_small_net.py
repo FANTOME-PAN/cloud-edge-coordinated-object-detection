@@ -10,8 +10,10 @@ import torch.optim as optim
 import torch.backends.cudnn as cudnn
 import torch.utils.data as data
 import argparse
-from train_big_ssd import adjust_learning_rate, weights_init
-from data.config import helmet_lite
+# from train_big_ssd import adjust_learning_rate, weights_init
+from utils.basic_utils import adjust_learning_rate, weights_init
+from data.config import helmet_lite, voc, voc_lite, helmet
+from data.voc0712 import VOC_ROOT, VOCDetection
 from small_net import SmallNet, ConfNet1
 from utils.evaluations import parse_rec, voc_ap, get_conf_gt
 import os.path as osp
@@ -28,9 +30,9 @@ parser = argparse.ArgumentParser(
 train_set = parser.add_mutually_exclusive_group()
 parser.add_argument('--dataset', default='helmet', choices=['VOC', 'COCO', 'helmet'],
                     type=str, help='VOC or COCO')
-parser.add_argument('--dataset_root', default=HELMET_ROOT,
-                    help='Dataset root directory path')
-parser.add_argument('--bignet', default='helmet_big_net.pth',
+# parser.add_argument('--dataset_root', default=HELMET_ROOT,
+#                     help='Dataset root directory path')
+parser.add_argument('--bignet', default='big_net_helmet.pth',
                     help='Big net for knowledge distilling')
 parser.add_argument('--conf_dataset', default=None,
                     help='The dataset for training confidence net')
@@ -56,67 +58,54 @@ parser.add_argument('--gamma', default=0.1, type=float,
                     help='Gamma update for SGD')
 parser.add_argument('--visdom', default=False, type=str2bool,
                     help='Use visdom for loss visualization')
+parser.add_argument('--only_det', default=False, type=str2bool,
+                    help='Only train the detection net and ignore the confidence net')
+parser.add_argument('--skip_det_net', default=False, type=str2bool,
+                    help='Skip training detection net')
 parser.add_argument('--save_folder', default='weights/',
                     help='Directory for saving checkpoint models')
 args = parser.parse_args()
 
 
-def train(skip_det_net=False):
+if torch.cuda.is_available():
+    if args.cuda:
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    if not args.cuda:
+        print("WARNING: It looks like you have a CUDA device, but aren't " +
+              "using CUDA.\nRun with --cuda for optimal training speed.")
+        torch.set_default_tensor_type('torch.FloatTensor')
+else:
+    torch.set_default_tensor_type('torch.FloatTensor')
+
+
+def train():
     if args.dataset == 'COCO':
         raise NotImplementedError()
     elif args.dataset == 'VOC':
-        raise NotImplementedError()
+        cfg = voc_lite
+        bignet_cfg = voc
+        dataset = VOCDetection(root=VOC_ROOT, transform=SSDAugmentation(cfg['min_dim'], MEANS))
     elif args.dataset == 'helmet':
         cfg = helmet_lite
+        bignet_cfg = helmet
         dataset = HelmetDetection(root=HELMET_ROOT, transform=SSDAugmentation(cfg['min_dim'], MEANS))
     else:
         raise RuntimeError()
     ssd_net = build_small_ssd('train', cfg['min_dim'], cfg['num_classes'])
-    net = ssd_net
-    big_net = build_ssd('train', helmet['min_dim'], helmet['num_classes']).cuda()
+    big_net = build_ssd('train', bignet_cfg['min_dim'], bignet_cfg['num_classes']).cuda()
     big_net.load_state_dict(torch.load(args.save_folder + args.bignet))
     conf_net = ConfNet1()
     small_net = SmallNet(ssd_net, conf_net)
 
-    data_loader = data.DataLoader(dataset, args.batch_size,
-                                  num_workers=args.num_workers,
-                                  shuffle=True, collate_fn=detection_collate,
-                                  pin_memory=True)
-
-    if args.cuda:
-        net = torch.nn.DataParallel(ssd_net)
-        cudnn.benchmark = True
-
-    if args.resume:
-        print('Resuming training, loading {}...'.format(args.resume))
-        ssd_net.load_weights(args.resume)
-    else:
-        if args.basenet is None:
-            print('Training base net (vgg lite & conv6 conv7)')
-            train_vgg(ssd_net.cuda(), big_net, data_loader)
-        else:
-            init_ssd_weights = torch.load(args.save_folder + args.basenet)
-            print('Loading base network...')
-            net.load_state_dict(init_ssd_weights)
-
-    if args.cuda:
-        net = net.cuda()
-
-    if not args.resume:
-        print('Initializing weights...')
-        # initialize newly added layers' weights with xavier method
-        ssd_net.extras.apply(weights_init)
-        ssd_net.loc.apply(weights_init)
-        ssd_net.conf.apply(weights_init)
-
-    net.train()
-
     print('Start training...')
-    if not skip_det_net:
-        train_detection_net(net, big_net, data_loader, cfg, True)
+    if not args.skip_det_net:
+        train_detection_net(ssd_net, big_net, dataset, cfg, True)
         torch.save(ssd_net.state_dict(), args.save_folder + 'helmet_detection_net.pth')
     else:
         print('skip training detection net.')
+
+    if args.only_det:
+        return
 
     # prepare data for confidence net
     if args.conf_dataset is None:
@@ -132,6 +121,7 @@ def train(skip_det_net=False):
                                    shuffle=True,
                                    pin_memory=True)
 
+    net = conf_net
     if args.cuda:
         net = torch.nn.DataParallel(conf_net)
         cudnn.benchmark = True
@@ -157,7 +147,7 @@ def train_vgg(net: SmallSSD, big_net: SSD, data_loader: data.DataLoader, cfg=hel
     for iteration in range(20000):
         if iteration in [15000, 17500, 20000]:
             step_index += 1
-            adjust_learning_rate(optimizer, args.gamma, step_index)
+            adjust_learning_rate(optimizer, args.gamma, step_index, args.lr)
 
         # load train data
         try:
@@ -194,7 +184,39 @@ def train_vgg(net: SmallSSD, big_net: SSD, data_loader: data.DataLoader, cfg=hel
     pass
 
 
-def train_detection_net(net: SmallSSD, big_net: SSD, data_loader: data.DataLoader, cfg, distill=True):
+def train_detection_net(ssd_net: SmallSSD, big_net: SSD, dataset: data.Dataset, cfg, distill=True):
+    net = ssd_net
+    data_loader = data.DataLoader(dataset, args.batch_size,
+                                  num_workers=args.num_workers,
+                                  shuffle=True, collate_fn=detection_collate,
+                                  pin_memory=True)
+
+    if args.cuda:
+        net = torch.nn.DataParallel(ssd_net)
+        cudnn.benchmark = True
+
+    if args.resume:
+        print('Resuming training, loading {}...'.format(args.resume))
+        ssd_net.load_weights(args.resume)
+    else:
+        if args.basenet is None:
+            print('Training base net (vgg lite & conv6 conv7)')
+            train_vgg(ssd_net.cuda(), big_net, data_loader)
+        else:
+            init_ssd_weights = torch.load(args.save_folder + args.basenet)
+            print('Loading base network...')
+            ssd_net.load_state_dict(init_ssd_weights)
+
+    if args.cuda:
+        net = net.cuda()
+
+    if not args.resume:
+        print('Initializing weights...')
+        # initialize newly added layers' weights with xavier method
+        ssd_net.extras.apply(weights_init)
+        ssd_net.loc.apply(weights_init)
+        ssd_net.conf.apply(weights_init)
+
     print('---- training detection net ----')
     optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
                           weight_decay=args.weight_decay)
@@ -213,7 +235,7 @@ def train_detection_net(net: SmallSSD, big_net: SSD, data_loader: data.DataLoade
     for iteration in range(args.start_iter, cfg['max_iter']):
         if iteration in cfg['lr_steps']:
             step_index += 1
-            adjust_learning_rate(optimizer, args.gamma, step_index)
+            adjust_learning_rate(optimizer, args.gamma, step_index, args.lr)
 
         # load train data
         try:
@@ -250,10 +272,8 @@ def train_detection_net(net: SmallSSD, big_net: SSD, data_loader: data.DataLoade
 
         if iteration != 0 and iteration % 1000 == 0:
             print('Saving state, iter:', iteration)
-            torch.save(net.state_dict(), 'weights/ttsmall_ssd_helmet_' +
-                       repr(iteration) + '.pth')
-    torch.save(net.state_dict(),
-               args.save_folder + 'ttsmall_ssd_' + args.dataset + '.pth')
+            torch.save(ssd_net.state_dict(), 'weights/cache/det_net_%s_%s.pth' % (args.dataset, repr(iteration)))
+    torch.save(ssd_net.state_dict(), args.save_folder + 'det_net_' + args.dataset + '.pth')
 
 
 # 当 mAP 大于 conf_thresh，将 GT 设为 1；否则，设为 0
@@ -573,4 +593,4 @@ def train_confidence_net(net, data_loader: data.DataLoader):
 
 
 if __name__ == '__main__':
-    train(True)
+    train()
